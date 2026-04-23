@@ -36,9 +36,9 @@ DEFAULT_PREFIX = "%"
 DB_PATH = "mfast.db"
 
 # Intervalle entre chaque backup auto (minutes)
-BACKUP_INTERVAL_MIN = 60
+BACKUP_INTERVAL_MIN = 5
 # Nb max de backups gardés par guild (on purge les vieux)
-MAX_BACKUPS_PER_GUILD = 10
+MAX_BACKUPS_PER_GUILD = 2
 # Durée après laquelle on purge l'historique des actions (jours)
 ACTION_HISTORY_DAYS = 30
 
@@ -909,6 +909,15 @@ async def send_log(guild, title, author=None, desc=None, color=0xe74c3c, action=
     await send_log_embed(guild, em, action=action, content=content)
 
 
+async def send_bot_log(guild, title, author=None, desc=None, color=0x3498db, emoji="⚙️"):
+    """Log interne du bot (commandes Buyer, erreurs, config) → routé vers logs-mfast."""
+    em = discord.Embed(title=f"{emoji} {title}", description=desc or "", color=color)
+    if author:
+        em.add_field(name="Par", value=f"{author.mention} (`{author.id}`)", inline=False)
+    em.set_footer(text=f"mFast ・ {format_french_date()}")
+    await send_log_embed(guild, em, action="_mfast_internal")
+
+
 # ========================= BOT SETUP =========================
 
 init_db()
@@ -961,12 +970,30 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.BadArgument):
         await ctx.send(embed=error_embed("❌ Argument invalide", str(error)))
         return
-    log.error(f"Erreur non gérée '{ctx.command}' : {error}\n"
-              + "".join(traceback.format_exception(type(error), error, error.__traceback__)))
+    # Erreur non gérée → log stdout + log Discord
+    err_txt = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    log.error(f"Erreur non gérée '{ctx.command}' : {error}\n{err_txt}")
     try:
-        await ctx.send(embed=error_embed("❌ Erreur interne", "Voir les logs."))
+        await ctx.send(embed=error_embed("❌ Erreur interne", f"`{type(error).__name__}: {error}`"))
     except discord.HTTPException:
         pass
+    # Log dans logs-mfast
+    try:
+        if ctx.guild:
+            await send_bot_log(
+                ctx.guild,
+                "❌ Erreur de commande",
+                author=ctx.author,
+                desc=(
+                    f"**Commande :** `{ctx.command}`\n"
+                    f"**Type :** `{type(error).__name__}`\n"
+                    f"**Message :** ```\n{str(error)[:500]}\n```"
+                ),
+                color=0xf04747,
+                emoji="❌",
+            )
+    except Exception as e:
+        log.error(f"Impossible de log l'erreur dans Discord : {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1027,7 +1054,7 @@ async def check_action_and_react(guild, user_id, action, target=None, target_nam
             max_limit=0, window=0, count=1, action_id=action_id,
         )
         if revert_fn:
-            await try_revert(guild, revert_fn, revert_args, action_id)
+            await try_revert(guild, revert_fn, revert_args, action_id, action=action)
         return
 
     # --- WL/Owner/Sys : check de la limite ---
@@ -1044,7 +1071,7 @@ async def check_action_and_react(guild, user_id, action, target=None, target_nam
             max_limit=0, window=0, count=1, action_id=action_id,
         )
         if revert_fn:
-            await try_revert(guild, revert_fn, revert_args, action_id)
+            await try_revert(guild, revert_fn, revert_args, action_id, action=action)
         return
 
     if limit is None:
@@ -1072,7 +1099,7 @@ async def check_action_and_react(guild, user_id, action, target=None, target_nam
             action_id=action_id,
         )
         if revert_fn:
-            await try_revert(guild, revert_fn, revert_args, action_id)
+            await try_revert(guild, revert_fn, revert_args, action_id, action=action)
         return
 
     # Dans les clous → record + log avec quota restant
@@ -1133,7 +1160,7 @@ async def _log_action_event(guild, user_id, action, target_name,
 
 
 async def execute_auto_ban(guild, user_id, action, reason, max_limit, window, count, action_id=None):
-    """Ban la personne + alerte dans le salon de log."""
+    """Ban la personne + alerte dans le salon de log (groupé par action)."""
     member = guild.get_member(user_id)
 
     # Log en DB
@@ -1168,7 +1195,7 @@ async def execute_auto_ban(guild, user_id, action, reason, max_limit, window, co
     except discord.HTTPException as e:
         log.error(f"AUTO-BAN échoué : {e}")
 
-    # Alerte
+    # Alerte — routée vers le salon groupé correspondant à l'action
     em = critical_embed(
         "🚨 BAN AUTOMATIQUE",
         f"**Auteur :** <@{user_id}> (`{user_id}`)\n"
@@ -1179,11 +1206,11 @@ async def execute_auto_ban(guild, user_id, action, reason, max_limit, window, co
         + (f"\n**Action ID :** `#{action_id}`" if action_id else "")
     )
     em.set_footer(text=f"mFast ・ {format_french_date()}")
-    await send_log_embed(guild, em)
+    await send_log_embed(guild, em, action=action, content=f"<@{user_id}>")
 
 
-async def try_revert(guild, revert_fn, revert_args, action_id):
-    """Tente d'annuler une action. Logue le résultat."""
+async def try_revert(guild, revert_fn, revert_args, action_id, action=None):
+    """Tente d'annuler une action. Logue le résultat dans le salon groupé."""
     try:
         ok = await revert_fn(guild, *revert_args) if revert_args else await revert_fn(guild)
         if ok:
@@ -1192,13 +1219,13 @@ async def try_revert(guild, revert_fn, revert_args, action_id):
                 "✅ Revert appliqué",
                 f"Action `#{action_id}` a été annulée avec succès."
             )
-            await send_log_embed(guild, em)
+            await send_log_embed(guild, em, action=action)
         else:
             em = warning_embed(
                 "⚠️ Revert échoué",
                 f"L'action `#{action_id}` n'a pas pu être annulée automatiquement."
             )
-            await send_log_embed(guild, em)
+            await send_log_embed(guild, em, action=action)
     except Exception as e:
         log.error(f"Revert erreur : {e}\n{traceback.format_exc()}")
 
@@ -1911,6 +1938,8 @@ async def _prefix(ctx, new_prefix: str = None):
         return await ctx.send(embed=info_embed("Prefix actuel", f"`{get_prefix_cached()}`"))
     set_config("prefix", new_prefix)
     await ctx.send(embed=success_embed("✅ Prefix modifié", f"Nouveau prefix : `{new_prefix}`"))
+    await send_bot_log(ctx.guild, "Prefix modifié", ctx.author,
+                       desc=f"Nouveau prefix : `{new_prefix}`", color=0x3498db, emoji="⚙️")
 
 
 @bot.command(name="setlog")
@@ -1924,6 +1953,8 @@ async def _setlog(ctx, channel: discord.TextChannel = None):
         f"Les alertes mFast sans salon dédié iront dans {channel.mention}.\n"
         f"Pour un salon par type d'action, utilise `{get_prefix_cached()}categorie <id_categorie>`."
     ))
+    await send_bot_log(ctx.guild, "Salon de logs global défini", ctx.author,
+                       desc=f"Salon : {channel.mention}", color=0x3498db, emoji="⚙️")
 
 
 # ========================= CATÉGORIE DE LOGS =========================
@@ -1989,7 +2020,7 @@ async def _categorie(ctx, category_input: str = None):
     msg = await ctx.send(embed=info_embed(
         "⏳ Configuration en cours...",
         f"Création des salons de log dans **{category.name}**.\n"
-        f"Je vais créer **{len(WATCHED_ACTIONS)}** salons. Ça peut prendre ~30s à cause des rate limits."
+        f"Je vais créer **7** salons regroupés par thème (membres, vocal, rôles, salons, serveur, bots, + logs mFast internes)."
     ))
 
     # Enregistre la catégorie
@@ -2013,57 +2044,60 @@ async def _categorie(ctx, category_input: str = None):
     created = 0
     errors = []
 
-    # Regroupement logique pour nommer les salons (court et clair)
-    channel_names = {
-        # Membres
-        "ban":                "logs-ban",
-        "unban":              "logs-unban",
-        "kick":               "logs-kick",
-        "timeout":            "logs-timeout",
-        "vdisconnect":        "logs-voc-deco",
-        "vmove":              "logs-voc-move",
-        "member_role_add":    "logs-role-add",
-        "member_role_remove": "logs-role-remove",
-        "member_nick":        "logs-pseudo",
-        # Rôles
-        "role_create":        "logs-role-create",
-        "role_delete":        "logs-role-delete",
-        "role_update":        "logs-role-update",
-        "role_grant_admin":   "logs-admin-grant",
-        # Salons
-        "channel_create":     "logs-salon-create",
-        "channel_delete":     "logs-salon-delete",
-        "channel_update":     "logs-salon-update",
-        "overwrite_update":   "logs-overwrites",
-        # Serveur
-        "guild_update":       "logs-serveur",
-        "webhook_create":     "logs-webhook-create",
-        "webhook_delete":     "logs-webhook-delete",
-        "emoji_create":       "logs-emoji-create",
-        "emoji_delete":       "logs-emoji-delete",
-        "bot_add":            "logs-bot-add",
+    # Regroupement : 7 salons qui mutualisent plusieurs actions
+    LOG_GROUPS = {
+        "logs-membres": {
+            "topic": "Logs liés aux membres : ban, unban, kick, timeout, changement de pseudo",
+            "actions": ["ban", "unban", "kick", "timeout", "member_nick"],
+        },
+        "logs-vocal": {
+            "topic": "Logs liés au vocal : déconnexion et déplacement forcés",
+            "actions": ["vdisconnect", "vmove"],
+        },
+        "logs-roles": {
+            "topic": "Logs liés aux rôles : création, suppression, modification, attribution, ajout de perm admin",
+            "actions": ["role_create", "role_delete", "role_update", "role_grant_admin",
+                        "member_role_add", "member_role_remove"],
+        },
+        "logs-salons": {
+            "topic": "Logs liés aux salons : création, suppression, modification, dérogations",
+            "actions": ["channel_create", "channel_delete", "channel_update", "overwrite_update"],
+        },
+        "logs-serveur": {
+            "topic": "Logs liés au serveur : paramètres, webhooks, emojis",
+            "actions": ["guild_update", "webhook_create", "webhook_delete",
+                        "emoji_create", "emoji_delete"],
+        },
+        "logs-bots": {
+            "topic": "Logs liés aux bots ajoutés/retirés du serveur",
+            "actions": ["bot_add"],
+        },
+        "logs-mfast": {
+            "topic": "Logs internes du bot mFast : commandes Buyer, config, erreurs, reverts manuels",
+            "actions": ["_mfast_internal"],  # action virtuelle pour router les logs bot
+        },
     }
 
-    for action in WATCHED_ACTIONS.keys():
-        name = channel_names.get(action, f"logs-{action}")
+    for group_name, group_data in LOG_GROUPS.items():
         try:
             new_ch = await ctx.guild.create_text_channel(
-                name=name,
+                name=group_name,
                 category=category,
                 overwrites=overwrites,
-                topic=f"mFast : logs pour l'action `{action}` ({WATCHED_ACTIONS[action]})",
+                topic=f"mFast : {group_data['topic']}",
                 reason=f"mFast setup catégorie par {ctx.author}",
             )
-            set_action_channel(ctx.guild.id, action, new_ch.id)
+            # Toutes les actions du groupe pointent vers ce même salon
+            for action in group_data["actions"]:
+                set_action_channel(ctx.guild.id, action, new_ch.id)
             created += 1
-            # Petit délai pour éviter rate limit Discord
             await asyncio.sleep(0.6)
         except discord.Forbidden as e:
-            errors.append(f"`{action}` : permission refusée")
-            log.error(f"categorie: {action} échoué (Forbidden) : {e}")
+            errors.append(f"`{group_name}` : permission refusée")
+            log.error(f"categorie: {group_name} échoué (Forbidden) : {e}")
         except discord.HTTPException as e:
-            errors.append(f"`{action}` : {e}")
-            log.error(f"categorie: {action} échoué : {e}")
+            errors.append(f"`{group_name}` : {e}")
+            log.error(f"categorie: {group_name} échoué : {e}")
 
     # Résultat
     try:
@@ -2074,7 +2108,7 @@ async def _categorie(ctx, category_input: str = None):
     em = success_embed(
         "✅ Catégorie configurée",
         f"**Catégorie :** {category.mention}\n"
-        f"**Salons créés :** {created} / {len(WATCHED_ACTIONS)}\n"
+        f"**Salons créés :** {created} / {len(LOG_GROUPS)}\n"
         + (f"**Erreurs :** {len(errors)}" if errors else "")
     )
     if errors:
@@ -2094,6 +2128,9 @@ async def _categorie(ctx, category_input: str = None):
         inline=False,
     )
     await ctx.send(embed=em)
+    await send_bot_log(ctx.guild, "Catégorie de logs configurée", ctx.author,
+                       desc=f"Catégorie : {category.mention}\n**{created}** salons créés.",
+                       color=0x3498db, emoji="📂")
 
 
 @bot.command(name="uncategorie", aliases=["uncategory"])
@@ -2160,6 +2197,9 @@ async def _wl(ctx, *, user_input: str = None):
         "✅ WL ajouté",
         f"{format_user_display(display, uid)} est maintenant **WL**."
     ))
+    await send_bot_log(ctx.guild, "WL ajouté", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0x43b581, emoji="🛡️")
 
 
 @bot.command(name="unwl")
@@ -2173,6 +2213,9 @@ async def _unwl(ctx, *, user_input: str = None):
         return await ctx.send(embed=error_embed("Pas WL", f"{format_user_display(display, uid)} n'est pas WL."))
     set_rank(uid, 0)
     await ctx.send(embed=success_embed("✅ WL retiré", f"{format_user_display(display, uid)} n'est plus WL."))
+    await send_bot_log(ctx.guild, "WL retiré", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0xfaa61a, emoji="🛡️")
 
 
 @bot.command(name="owner")
@@ -2195,6 +2238,9 @@ async def _owner(ctx, *, user_input: str = None):
         "✅ Owner ajouté",
         f"{format_user_display(display, uid)} est maintenant **Owner**."
     ))
+    await send_bot_log(ctx.guild, "Owner ajouté", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0x43b581, emoji="⚔️")
 
 
 @bot.command(name="unowner")
@@ -2208,6 +2254,9 @@ async def _unowner(ctx, *, user_input: str = None):
         return await ctx.send(embed=error_embed("Pas Owner", f"{format_user_display(display, uid)} n'est pas Owner."))
     set_rank(uid, 0)
     await ctx.send(embed=success_embed("✅ Owner retiré", f"{format_user_display(display, uid)} n'est plus Owner."))
+    await send_bot_log(ctx.guild, "Owner retiré", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0xfaa61a, emoji="⚔️")
 
 
 @bot.command(name="sys")
@@ -2230,6 +2279,9 @@ async def _sys(ctx, *, user_input: str = None):
         "✅ Sys ajouté",
         f"{format_user_display(display, uid)} est maintenant **Sys**."
     ))
+    await send_bot_log(ctx.guild, "Sys ajouté", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0x43b581, emoji="🔧")
 
 
 @bot.command(name="unsys")
@@ -2243,6 +2295,9 @@ async def _unsys(ctx, *, user_input: str = None):
         return await ctx.send(embed=error_embed("Pas Sys", f"{format_user_display(display, uid)} n'est pas Sys."))
     set_rank(uid, 0)
     await ctx.send(embed=success_embed("✅ Sys retiré", f"{format_user_display(display, uid)} n'est plus Sys."))
+    await send_bot_log(ctx.guild, "Sys retiré", ctx.author,
+                       desc=f"Cible : {format_user_display(display, uid)}",
+                       color=0xfaa61a, emoji="🔧")
 
 
 # ========================= BOTS WHITELIST =========================
@@ -2284,6 +2339,9 @@ async def _bot(ctx, *, user_input: str = None):
         "✅ Bot whitelisté",
         f"🤖 **{bot_name}** (`{uid}`) bypass maintenant toutes les limites mFast."
     ))
+    await send_bot_log(ctx.guild, "Bot whitelisté", ctx.author,
+                       desc=f"Bot : **{bot_name}** (`{uid}`)",
+                       color=0x43b581, emoji="🤖")
 
 
 @bot.command(name="unbot")
@@ -2298,6 +2356,9 @@ async def _unbot(ctx, *, user_input: str = None):
     wl_bot_remove(ctx.guild.id, uid)
     bot_name = getattr(display, "name", None) or f"ID {uid}"
     await ctx.send(embed=success_embed("✅ Bot retiré", f"🤖 **{bot_name}** n'est plus whitelisté."))
+    await send_bot_log(ctx.guild, "Bot retiré de la whitelist", ctx.author,
+                       desc=f"Bot : **{bot_name}** (`{uid}`)",
+                       color=0xfaa61a, emoji="🤖")
 
 
 @bot.command(name="bots")
@@ -2367,6 +2428,9 @@ async def _setlimit(ctx, action: str = None, rank_str: str = None,
         "✅ Limite configurée",
         f"`{action}` pour **{rank_name(rank)}** : {desc}"
     ))
+    await send_bot_log(ctx.guild, "Limite configurée", ctx.author,
+                       desc=f"Action `{action}` / {rank_name(rank)} → {desc}",
+                       color=0x3498db, emoji="⏱️")
 
 
 @bot.command(name="unsetlimit")
@@ -2427,6 +2491,9 @@ async def _backup(ctx):
             "✅ Backup effectué",
             f"Backup `#{backup_id}` sauvegardé."
         ))
+        await send_bot_log(ctx.guild, "Backup manuel", ctx.author,
+                           desc=f"Backup `#{backup_id}` créé.",
+                           color=0x3498db, emoji="📦")
     else:
         await ctx.send(embed=error_embed(
             "❌ Backup échoué",
@@ -2446,8 +2513,178 @@ async def _backuplist(ctx):
         emoji = trigger_emoji.get(b["trigger"], "📦")
         lines.append(f"{emoji} `#{b['id']}` ・ {format_datetime(b['created_at'])} ・ *{b['trigger']}*")
     em = info_embed(f"📦 Backups ({len(backups)})", "\n".join(lines))
-    em.set_footer(text="mFast ・ Revert auto en cas d'abus (pas de commande manuelle)")
+    em.set_footer(text=f"mFast ・ Auto toutes les {BACKUP_INTERVAL_MIN}min, {MAX_BACKUPS_PER_GUILD} gardés max")
     await ctx.send(embed=em)
+
+
+# ========================= REVERT MANUEL =========================
+
+_pending_reverts = {}
+
+
+@bot.command(name="revert")
+async def _revert(ctx, backup_id: int = None):
+    """
+    Revert manuel : recrée rôles et salons manquants depuis la dernière backup (ou backup_id).
+    Buyer uniquement. Confirmation requise avec %revertconfirm.
+    """
+    if backup_id is None:
+        backup = get_latest_backup(ctx.guild.id)
+        if not backup:
+            return await ctx.send(embed=error_embed(
+                "❌ Aucun backup",
+                f"Pas de backup disponible. Fais `{get_prefix_cached()}backup` pour en créer un."
+            ))
+    else:
+        backup = get_backup(backup_id)
+        if not backup or str(backup["guild_id"]) != str(ctx.guild.id):
+            return await ctx.send(embed=error_embed(
+                "❌ Backup introuvable",
+                f"Pas de backup `#{backup_id}` sur ce serveur."
+            ))
+
+    nb_roles = len(backup.get("roles") or [])
+    nb_channels = len(backup.get("channels") or [])
+
+    em = warning_embed(
+        "⚠️ Confirmation revert manuel",
+        f"Tu vas restaurer le serveur depuis le backup `#{backup['id']}`\n"
+        f"du **{format_datetime(backup['created_at'])}** (trigger : *{backup['trigger']}*).\n\n"
+        f"**Rôles dans le backup :** {nb_roles}\n"
+        f"**Salons dans le backup :** {nb_channels}\n\n"
+        f"🔄 Je vais recréer **uniquement** les rôles et salons **manquants** sur le serveur.\n"
+        f"Les rôles/salons existants ne seront **pas** modifiés.\n\n"
+        f"Tape `{get_prefix_cached()}revertconfirm` dans les 30s pour valider."
+    )
+    await ctx.send(embed=em)
+
+    _pending_reverts[ctx.author.id] = {
+        "guild_id": ctx.guild.id,
+        "backup_id": backup["id"],
+        "expires": datetime.now(PARIS_TZ) + timedelta(seconds=30),
+    }
+
+
+@bot.command(name="revertconfirm")
+async def _revertconfirm(ctx):
+    """Confirmer le revert manuel (dans les 30s)."""
+    pending = _pending_reverts.get(ctx.author.id)
+    if not pending:
+        return await ctx.send(embed=error_embed(
+            "❌ Aucune demande",
+            f"Fais d'abord `{get_prefix_cached()}revert` pour lancer un revert."
+        ))
+    if pending["expires"] < datetime.now(PARIS_TZ):
+        del _pending_reverts[ctx.author.id]
+        return await ctx.send(embed=error_embed("❌ Expiré", "Demande expirée, refais-la."))
+    if pending["guild_id"] != ctx.guild.id:
+        return await ctx.send(embed=error_embed("❌ Mauvais serveur", ""))
+
+    backup = get_backup(pending["backup_id"])
+    if not backup:
+        del _pending_reverts[ctx.author.id]
+        return await ctx.send(embed=error_embed("❌ Backup introuvable", ""))
+
+    del _pending_reverts[ctx.author.id]
+
+    await ctx.send(embed=info_embed(
+        "⏳ Revert en cours...",
+        "Ça peut prendre ~30s selon le nombre d'éléments à recréer."
+    ))
+
+    created_roles = 0
+    created_channels = 0
+    errors = []
+
+    # 1. Restaurer les rôles manquants
+    if backup.get("roles"):
+        existing_role_names = {r.name for r in ctx.guild.roles}
+        for role_data in backup["roles"]:
+            if role_data.get("is_default") or role_data.get("is_managed"):
+                continue
+            if role_data["name"] in existing_role_names:
+                continue
+            try:
+                await ctx.guild.create_role(
+                    name=role_data["name"],
+                    permissions=discord.Permissions(int(role_data.get("permissions", 0))),
+                    color=discord.Color(int(role_data.get("color", 0))),
+                    hoist=role_data.get("hoist", False),
+                    mentionable=role_data.get("mentionable", False),
+                    reason=f"mFast revert manuel par {ctx.author}",
+                )
+                created_roles += 1
+                await asyncio.sleep(0.4)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                errors.append(f"Rôle `{role_data['name']}` : {type(e).__name__}")
+
+    # 2. Restaurer les salons manquants (catégories d'abord)
+    if backup.get("channels"):
+        existing_channel_names = {ch.name for ch in ctx.guild.channels}
+        # Catégories
+        for ch_data in backup["channels"]:
+            if "category" not in ch_data.get("type", ""):
+                continue
+            if ch_data["name"] in existing_channel_names:
+                continue
+            try:
+                await ctx.guild.create_category(
+                    name=ch_data["name"],
+                    reason=f"mFast revert manuel par {ctx.author}",
+                )
+                created_channels += 1
+                await asyncio.sleep(0.4)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                errors.append(f"Catégorie `{ch_data['name']}` : {type(e).__name__}")
+        # Salons
+        for ch_data in backup["channels"]:
+            if "category" in ch_data.get("type", ""):
+                continue
+            if ch_data["name"] in existing_channel_names:
+                continue
+            try:
+                category = None
+                if ch_data.get("category_name"):
+                    for cat in ctx.guild.categories:
+                        if cat.name == ch_data["category_name"]:
+                            category = cat
+                            break
+                ch_type = ch_data.get("type", "")
+                if "text" in ch_type or "news" in ch_type:
+                    await ctx.guild.create_text_channel(
+                        name=ch_data["name"], category=category,
+                        topic=ch_data.get("topic"),
+                        nsfw=ch_data.get("nsfw", False),
+                        slowmode_delay=ch_data.get("slowmode_delay", 0),
+                        reason=f"mFast revert manuel par {ctx.author}",
+                    )
+                elif "voice" in ch_type:
+                    await ctx.guild.create_voice_channel(
+                        name=ch_data["name"], category=category,
+                        bitrate=ch_data.get("bitrate") or 64000,
+                        user_limit=ch_data.get("user_limit") or 0,
+                        reason=f"mFast revert manuel par {ctx.author}",
+                    )
+                created_channels += 1
+                await asyncio.sleep(0.4)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                errors.append(f"Salon `{ch_data['name']}` : {type(e).__name__}")
+
+    # Rapport
+    em = success_embed(
+        "✅ Revert terminé",
+        f"**Backup utilisé :** `#{backup['id']}` du {format_datetime(backup['created_at'])}\n\n"
+        f"**Rôles recréés :** {created_roles}\n"
+        f"**Salons recréés :** {created_channels}\n"
+        f"**Erreurs :** {len(errors)}"
+        + (f"\n\n```\n" + "\n".join(errors[:10]) + "\n```" if errors else "")
+    )
+    await ctx.send(embed=em)
+    await send_bot_log(
+        ctx.guild, "Revert manuel exécuté", ctx.author,
+        desc=f"Backup `#{backup['id']}` ・ **{created_roles}** rôles et **{created_channels}** salons recréés.",
+        color=0x9b59b6, emoji="🔄",
+    )
 
 
 # ========================= HISTORY =========================
@@ -2541,6 +2778,9 @@ async def _lockdown(ctx, state: str = None):
             "🔒 LOCKDOWN ACTIVÉ",
             f"**{len(changed)}** rôles ont perdu Admin.\nSeuls les Sys+ conservent leurs droits."
         ))
+        await send_bot_log(ctx.guild, "Lockdown ACTIVÉ", ctx.author,
+                           desc=f"**{len(changed)}** rôles ont perdu Admin.",
+                           color=0xf04747, emoji="🔒")
     else:
         if not current or not current["enabled"]:
             return await ctx.send(embed=error_embed("Pas actif", "Lockdown désactivé."))
@@ -2566,6 +2806,9 @@ async def _lockdown(ctx, state: str = None):
             "🔓 Lockdown désactivé",
             f"**{len(restored)}** rôles restaurés."
         ))
+        await send_bot_log(ctx.guild, "Lockdown DÉSACTIVÉ", ctx.author,
+                           desc=f"**{len(restored)}** rôles restaurés.",
+                           color=0x43b581, emoji="🔓")
 
 
 # ========================= PANIC =========================
@@ -2625,6 +2868,9 @@ async def _panicconfirm(ctx):
         "🚨 PANIC EXÉCUTÉ",
         f"**Bannis :** {banned}\n**Épargnés :** {skipped}"
     ))
+    await send_bot_log(ctx.guild, "PANIC EXÉCUTÉ", ctx.author,
+                       desc=f"**Bannis :** {banned}\n**Épargnés (WL+) :** {skipped}",
+                       color=0xf04747, emoji="🚨")
 
 
 # ========================= HELP =========================
@@ -2645,9 +2891,9 @@ async def _help(ctx):
     )
 
     em.add_field(
-        name="📂 Catégorie de logs",
+        name="📂 Catégorie de logs (7 salons groupés)",
         value=(
-            f"`{p}categorie <id_categorie>` — crée un salon par type d'action\n"
+            f"`{p}categorie <id_categorie>` — crée **7 salons groupés** (membres, vocal, rôles, salons, serveur, bots, mfast)\n"
             f"`{p}categorie` — voir la config actuelle\n"
             f"`{p}uncategorie [delete]` — retirer (+ supprimer les salons si `delete`)"
         ),
@@ -2687,11 +2933,13 @@ async def _help(ctx):
     )
 
     em.add_field(
-        name="📦 Backups (auto toutes les 60min)",
+        name=f"📦 Backups (auto toutes les {BACKUP_INTERVAL_MIN}min, {MAX_BACKUPS_PER_GUILD} max)",
         value=(
-            f"`{p}backup` — backup manuel\n"
-            f"`{p}backuplist` — voir les backups\n"
-            f"*Le revert est **automatique** en cas d'abus. Pas de commande manuelle.*"
+            f"`{p}backup` — backup manuel immédiat\n"
+            f"`{p}backuplist` — voir les backups disponibles\n"
+            f"`{p}revert [id]` — **revert manuel** depuis le dernier backup (ou précis)\n"
+            f"`{p}revertconfirm` — valider le revert (30s)\n"
+            f"*Revert auto aussi en cas d'abus détecté (ban + restore de l'action).*"
         ),
         inline=False,
     )
