@@ -733,13 +733,29 @@ def build_guild_snapshot(guild):
             "overwrites": overrides,
         })
 
+    def _enum_to_int(val):
+        """Convertit un enum Discord en int de façon safe."""
+        if val is None:
+            return 0
+        # Les enums Discord ont un attribut .value qui est un int
+        if hasattr(val, "value"):
+            try:
+                return int(val.value)
+            except (ValueError, TypeError):
+                pass
+        # Fallback : tenter la conversion directe
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
     guild_data = {
         "id": str(guild.id),
         "name": guild.name,
-        "verification_level": str(guild.verification_level),
-        "mfa_level": int(guild.mfa_level) if hasattr(guild, "mfa_level") else 0,
-        "default_notifications": str(guild.default_notifications),
-        "explicit_content_filter": str(guild.explicit_content_filter),
+        "verification_level": _enum_to_int(guild.verification_level),
+        "mfa_level": _enum_to_int(getattr(guild, "mfa_level", 0)),
+        "default_notifications": _enum_to_int(guild.default_notifications),
+        "explicit_content_filter": _enum_to_int(guild.explicit_content_filter),
         "afk_timeout": guild.afk_timeout,
         "afk_channel_id": str(guild.afk_channel.id) if guild.afk_channel else None,
         "system_channel_id": str(guild.system_channel.id) if guild.system_channel else None,
