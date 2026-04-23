@@ -70,9 +70,6 @@ WATCHED_ACTIONS = {
     "timeout":            "Timeout (mute Discord) un membre",
     "vdisconnect":        "Déconnecter quelqu'un d'un vocal",
     "vmove":              "Déplacer quelqu'un entre vocaux",
-    "member_role_add":    "Ajouter un rôle à un membre",
-    "member_role_remove": "Retirer un rôle à un membre",
-    "member_nick":        "Modifier le pseudo d'un membre",
 
     # Rôles
     "role_create":        "Créer un rôle",
@@ -88,10 +85,9 @@ WATCHED_ACTIONS = {
 
     # Serveur
     "guild_update":       "Modifier le serveur (nom, icône, etc.)",
+    "vanity_url":         "Modifier la vanity URL du serveur",
     "webhook_create":     "Créer un webhook",
     "webhook_delete":     "Supprimer un webhook",
-    "emoji_create":       "Créer un emoji",
-    "emoji_delete":       "Supprimer un emoji",
     "bot_add":            "Ajouter un bot au serveur",
 }
 
@@ -110,9 +106,6 @@ DEFAULT_LIMITS = {
     "timeout":            {1: (10, 30), 2: (25, 30),  3: (50, 30)},
     "vdisconnect":        {1: (10, 30), 2: (30, 30),  3: (60, 30)},
     "vmove":              {1: (15, 30), 2: (30, 30),  3: (60, 30)},
-    "member_role_add":    {1: (10, 30), 2: (30, 30),  3: (60, 30)},
-    "member_role_remove": {1: (10, 30), 2: (30, 30),  3: (60, 30)},
-    "member_nick":        {1: (10, 30), 2: (30, 30),  3: (60, 30)},
 
     # --- Rôles ---
     "role_create":        {1: (1, 60),  2: (3, 60),   3: (10, 60)},
@@ -128,10 +121,9 @@ DEFAULT_LIMITS = {
 
     # --- Serveur ---
     "guild_update":       {1: (0, 0),   2: (2, 1440), 3: (10, 1440)},
+    "vanity_url":         {1: (0, 0),   2: (0, 0),    3: (0, 0)},  # Buyer only !
     "webhook_create":     {1: (0, 0),   2: (2, 60),   3: (5, 60)},
     "webhook_delete":     {1: (2, 60),  2: (5, 60),   3: (15, 60)},
-    "emoji_create":       {1: (5, 60),  2: (15, 60),  3: (30, 60)},
-    "emoji_delete":       {1: (2, 60),  2: (10, 60),  3: (25, 60)},
     "bot_add":            {1: (0, 0),   2: (1, 1440), 3: (3, 1440)},
 }
 
@@ -1491,7 +1483,15 @@ async def on_member_remove(member):
 
 @bot.event
 async def on_member_update(before, after):
-    """Détecte attribution/retrait de rôle + timeout + changement pseudo."""
+    """
+    Détecte uniquement les changements sensibles :
+    - Timeout appliqué (cf. action `timeout`)
+    - Attribution d'un rôle AVEC permissions dangereuses (admin / ban / kick / mention_everyone)
+
+    On ignore :
+    - Ajout/retrait de rôles "normaux" (rôle membre, rôle couleur, etc.)
+    - Changement de pseudo
+    """
     # Timeout (mute Discord)
     if before.timed_out_until != after.timed_out_until and after.timed_out_until is not None:
         actor_id, entry = await resolve_audit_actor(
@@ -1502,56 +1502,59 @@ async def on_member_update(before, after):
                 target=after, target_name=str(after),
             )
 
-    # Changement de pseudo
-    if before.nick != after.nick:
-        actor_id, entry = await resolve_audit_actor(
-            after.guild, discord.AuditLogAction.member_update, target_id=after.id)
-        if actor_id and actor_id != after.id:  # L'utilisateur peut changer son propre pseudo
-            await check_action_and_react(
-                after.guild, actor_id, "member_nick",
-                target=after, target_name=str(after),
-            )
-
-    # Changements de rôles
+    # Attribution d'un rôle DANGEREUX (admin, ban, kick, mention_everyone)
     before_roles = set(before.roles)
     after_roles = set(after.roles)
     added = after_roles - before_roles
-    removed = before_roles - after_roles
 
     for role in added:
         if role.is_default():
             continue
+        # On ne check QUE les rôles avec permissions dangereuses
+        perms = role.permissions
+        is_dangerous = (
+            perms.administrator or
+            perms.ban_members or
+            perms.kick_members or
+            perms.mention_everyone or
+            perms.manage_guild or
+            perms.manage_roles or
+            perms.manage_channels or
+            perms.manage_webhooks
+        )
+        if not is_dangerous:
+            continue  # Rôle inoffensif → on s'en fout
+
         actor_id, entry = await resolve_audit_actor(
             after.guild, discord.AuditLogAction.member_role_update, target_id=after.id)
         if actor_id is None or actor_id == bot.user.id:
             continue
+
+        # Liste des perms concernées pour le log
+        dangerous_perms = []
+        if perms.administrator: dangerous_perms.append("Administrator")
+        if perms.ban_members: dangerous_perms.append("Ban Members")
+        if perms.kick_members: dangerous_perms.append("Kick Members")
+        if perms.mention_everyone: dangerous_perms.append("Mention Everyone")
+        if perms.manage_guild: dangerous_perms.append("Manage Server")
+        if perms.manage_roles: dangerous_perms.append("Manage Roles")
+        if perms.manage_channels: dangerous_perms.append("Manage Channels")
+        if perms.manage_webhooks: dangerous_perms.append("Manage Webhooks")
+
         await check_action_and_react(
-            after.guild, actor_id, "member_role_add",
-            target=after, target_name=f"{after} (+rôle {role.name})",
+            after.guild, actor_id, "role_grant_admin",
+            target=after,
+            target_name=f"{after} (+rôle **{role.name}** avec : {', '.join(dangerous_perms)})",
             revert_fn=revert_member_role_add, revert_args=(after.id, role.id),
         )
-        # Si le rôle a la perm admin → c'est très critique, on double-alerte
-        if role.permissions.administrator:
-            em = critical_embed(
-                "🚨 RÔLE ADMIN DONNÉ À UN MEMBRE",
-                f"**Auteur :** <@{actor_id}>\n"
-                f"**Cible :** {after.mention}\n"
-                f"**Rôle :** {role.mention} (permissions administrateur)",
-            )
-            await send_log_embed(after.guild, em)
-
-    for role in removed:
-        if role.is_default():
-            continue
-        actor_id, entry = await resolve_audit_actor(
-            after.guild, discord.AuditLogAction.member_role_update, target_id=after.id)
-        if actor_id is None or actor_id == bot.user.id:
-            continue
-        await check_action_and_react(
-            after.guild, actor_id, "member_role_remove",
-            target=after, target_name=f"{after} (-rôle {role.name})",
-            revert_fn=revert_member_role_remove, revert_args=(after.id, role.id),
+        em = critical_embed(
+            "🚨 RÔLE DANGEREUX DONNÉ À UN MEMBRE",
+            f"**Auteur :** <@{actor_id}>\n"
+            f"**Cible :** {after.mention}\n"
+            f"**Rôle :** {role.mention}\n"
+            f"**Permissions dangereuses :** {', '.join(dangerous_perms)}",
         )
+        await send_log_embed(after.guild, em, action="role_grant_admin")
 
 
 @bot.event
@@ -1721,6 +1724,23 @@ async def on_guild_channel_update(before, after):
 
 @bot.event
 async def on_guild_update(before, after):
+    # --- 🚨 PROTECTION VANITY URL ULTRA-RAPIDE ---
+    # On check en premier parce que c'est le plus sensible (URL publique du serveur)
+    before_vanity = getattr(before, "vanity_url_code", None)
+    after_vanity = getattr(after, "vanity_url_code", None)
+
+    if before_vanity != after_vanity:
+        # CHANGEMENT DÉTECTÉ. On revert D'ABORD sans attendre l'audit log.
+        # Si l'ancien vanity existait, on le remet immédiatement.
+        # Le ban de l'auteur se fait ensuite en parallèle.
+
+        # On lance le revert en tâche parallèle pour pas bloquer
+        asyncio.create_task(_emergency_vanity_revert(after, before_vanity, after_vanity))
+        # On déclenche aussi la détection de l'auteur pour le ban
+        asyncio.create_task(_vanity_ban_author(after, before_vanity, after_vanity))
+        return  # on ne fait PAS le guild_update classique pour cet event
+
+    # --- Autres changements serveur (nom, icône, verif level) ---
     if (before.name != after.name or before.icon != after.icon or
         before.verification_level != after.verification_level):
         actor_id, entry = await resolve_audit_actor(
@@ -1731,6 +1751,91 @@ async def on_guild_update(before, after):
             after, actor_id, "guild_update",
             target=None, target_name=f"Serveur ({after.name})",
         )
+
+
+async def _emergency_vanity_revert(guild, old_vanity, new_vanity):
+    """Restaure la vanity URL en priorité absolue, sans attendre quoi que ce soit."""
+    if not old_vanity:
+        # Pas d'ancienne vanity à restaurer (premier setup)
+        log.warning(f"[VANITY] Changement détecté sur {guild.name} mais pas d'ancienne vanity à restaurer")
+        return
+    try:
+        # discord.py : guild.edit(vanity_code=...) n'existe pas directement,
+        # il faut utiliser la Route HTTP. On tente d'abord via guild.edit.
+        # En pratique on peut utiliser _state.http directement pour la vitesse max.
+        await guild.edit(vanity_code=old_vanity,
+                         reason="mFast : revert urgence vanity URL")
+        log.warning(f"[VANITY] ✅ Vanity URL restaurée sur {guild.name} : {new_vanity!r} → {old_vanity!r}")
+    except (AttributeError, TypeError):
+        # Fallback : appel HTTP direct
+        try:
+            await guild._state.http.change_vanity_code(
+                guild.id, old_vanity,
+                reason="mFast : revert urgence vanity URL",
+            )
+            log.warning(f"[VANITY] ✅ Vanity URL restaurée (HTTP) sur {guild.name}")
+        except Exception as e:
+            log.error(f"[VANITY] ❌ Revert échoué : {e}")
+    except discord.Forbidden:
+        log.error(f"[VANITY] ❌ Permission manquante pour restaurer la vanity URL")
+    except discord.HTTPException as e:
+        log.error(f"[VANITY] ❌ Erreur HTTP : {e}")
+
+
+async def _vanity_ban_author(guild, old_vanity, new_vanity):
+    """Trouve l'auteur du changement vanity et le ban (sauf si Buyer)."""
+    # Petit délai pour laisser l'audit log être écrit
+    await asyncio.sleep(1.5)
+
+    try:
+        async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.guild_update):
+            age = (datetime.now(PARIS_TZ) - entry.created_at.astimezone(PARIS_TZ)).total_seconds()
+            if age > 15:
+                continue
+            actor = entry.user
+            if not actor:
+                continue
+
+            # C'était notre revert → ignorer
+            if actor.id == bot.user.id:
+                continue
+
+            # Check si c'est un changement de vanity dans les changes
+            changed_vanity = False
+            if entry.changes:
+                for change in entry.changes:
+                    if getattr(change, "attribute", None) == "vanity_url_code":
+                        changed_vanity = True
+                        break
+            # Si on n'a pas pu confirmer, on prend quand même le dernier actor du guild_update récent
+            # (audit log peut être imprécis sur le détail des changes vanity)
+
+            # Buyer → OK, c'est lui qui a voulu changer, on NE REVERT PAS en fait
+            # Mais on a déjà lancé le revert en parallèle, donc c'est trop tard.
+            # Pour éviter ce cas : on check si c'est un Buyer, et si oui on re-remet sa nouvelle vanity
+            if is_buyer(actor.id):
+                log.info(f"[VANITY] Changement fait par Buyer {actor.id}, on re-set à {new_vanity!r}")
+                try:
+                    await guild.edit(vanity_code=new_vanity,
+                                    reason=f"mFast : changement validé (Buyer {actor.id})")
+                except Exception as e:
+                    log.error(f"[VANITY] Re-set Buyer échoué : {e}")
+                return
+
+            # Non-Buyer → BAN IMMÉDIAT
+            log.warning(f"[VANITY] Auteur non-Buyer identifié : {actor.id}, BAN en cours")
+            await check_action_and_react(
+                guild, actor.id, "vanity_url",
+                target=None,
+                target_name=f"Vanity URL : {old_vanity!r} → {new_vanity!r}",
+                revert_fn=None,  # déjà reverté
+                revert_args=None,
+            )
+            return
+    except discord.Forbidden:
+        log.warning(f"[VANITY] Audit logs inaccessibles sur {guild.name}")
+    except discord.HTTPException as e:
+        log.warning(f"[VANITY] Erreur audit log : {e}")
 
 
 @bot.event
@@ -1752,31 +1857,6 @@ async def on_webhooks_update(channel):
         channel.guild, actor_id, "webhook_create",
         target=channel, target_name=f"webhook in #{channel.name}",
     )
-
-
-@bot.event
-async def on_guild_emojis_update(guild, before, after):
-    before_ids = {e.id for e in before}
-    after_ids = {e.id for e in after}
-    added = after_ids - before_ids
-    removed = before_ids - after_ids
-
-    if added:
-        actor_id, entry = await resolve_audit_actor(
-            guild, discord.AuditLogAction.emoji_create)
-        if actor_id:
-            await check_action_and_react(
-                guild, actor_id, "emoji_create",
-                target=None, target_name=f"{len(added)} emoji(s)",
-            )
-    if removed:
-        actor_id, entry = await resolve_audit_actor(
-            guild, discord.AuditLogAction.emoji_delete)
-        if actor_id:
-            await check_action_and_react(
-                guild, actor_id, "emoji_delete",
-                target=None, target_name=f"{len(removed)} emoji(s)",
-            )
 
 
 @bot.event
@@ -2053,26 +2133,24 @@ async def _categorie(ctx, category_input: str = None):
     # Regroupement : 7 salons qui mutualisent plusieurs actions
     LOG_GROUPS = {
         "logs-membres": {
-            "topic": "Logs liés aux membres : ban, unban, kick, timeout, changement de pseudo",
-            "actions": ["ban", "unban", "kick", "timeout", "member_nick"],
+            "topic": "Logs liés aux membres : ban, unban, kick, timeout",
+            "actions": ["ban", "unban", "kick", "timeout"],
         },
         "logs-vocal": {
             "topic": "Logs liés au vocal : déconnexion et déplacement forcés",
             "actions": ["vdisconnect", "vmove"],
         },
         "logs-roles": {
-            "topic": "Logs liés aux rôles : création, suppression, modification, attribution, ajout de perm admin",
-            "actions": ["role_create", "role_delete", "role_update", "role_grant_admin",
-                        "member_role_add", "member_role_remove"],
+            "topic": "Logs liés aux rôles : création, suppression, modification, ajout de perm admin ou rôle dangereux",
+            "actions": ["role_create", "role_delete", "role_update", "role_grant_admin"],
         },
         "logs-salons": {
             "topic": "Logs liés aux salons : création, suppression, modification, dérogations",
             "actions": ["channel_create", "channel_delete", "channel_update", "overwrite_update"],
         },
         "logs-serveur": {
-            "topic": "Logs liés au serveur : paramètres, webhooks, emojis",
-            "actions": ["guild_update", "webhook_create", "webhook_delete",
-                        "emoji_create", "emoji_delete"],
+            "topic": "Logs liés au serveur : paramètres, vanity URL, webhooks",
+            "actions": ["guild_update", "vanity_url", "webhook_create", "webhook_delete"],
         },
         "logs-bots": {
             "topic": "Logs liés aux bots ajoutés/retirés du serveur",
