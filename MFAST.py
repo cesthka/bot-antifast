@@ -2963,53 +2963,57 @@ async def _panicconfirm(ctx):
 async def _help(ctx):
     p = get_prefix_cached()
     em = discord.Embed(
-        title="🛡️ mFast — Anti-nuke serveur",
+        title="🛡️  mFast — Anti-nuke",
+        description=(
+            f"**Prefix :** `{p}` ・ **Accès :** Buyer uniquement\n\n"
+            f"mFast protège le serveur en surveillant les actions sensibles "
+            f"via les audit logs Discord.\n"
+            f"*Tout abus → **ban automatique + revert**.*"
+        ),
         color=embed_color(),
     )
-    em.description = (
-        f"```\n🕐  {format_french_date()}\n```\n"
-        f"**Prefix :** `{p}` ・ **Accès :** Buyer uniquement\n\n"
-        f"mFast protège le serveur en surveillant toutes les actions sensibles via les audit logs.\n"
-        f"**Tout abus** (non-whitelist ou limite dépassée) → **ban automatique + revert automatique**.\n\n"
-        f"Les **bots** (Voice Master, Sanction, etc.) peuvent être whitelistés via `{p}bot @bot`."
-    )
+
+    # Thumbnail du serveur en haut à droite
+    if ctx.guild and ctx.guild.icon:
+        try:
+            em.set_thumbnail(url=ctx.guild.icon.url)
+        except (AttributeError, TypeError):
+            pass
 
     em.add_field(
-        name="📂 Catégorie de logs (7 salons groupés)",
+        name="🏁 Setup initial",
         value=(
-            f"`{p}categorie <id_categorie>` — crée **7 salons groupés** (membres, vocal, rôles, salons, serveur, bots, mfast)\n"
-            f"`{p}categorie` — voir la config actuelle\n"
-            f"`{p}uncategorie [delete]` — retirer (+ supprimer les salons si `delete`)"
+            f"`{p}categorie <id_categorie>` — crée les **7 salons de log** groupés\n"
+            f"`{p}setlog #salon` — salon log global (fallback)\n"
+            f"`{p}bot @bot` — whitelist un bot (bypass total)"
         ),
         inline=False,
     )
 
     em.add_field(
-        name="👥 Rangs",
+        name="👥 Gestion des rangs",
         value=(
-            f"`{p}wl @u` / `{p}unwl @u` — WL (limites strictes)\n"
-            f"`{p}owner @u` / `{p}unowner @u` — Owner (limites moyennes)\n"
-            f"`{p}sys @u` / `{p}unsys @u` — Sys (limites élevées)\n"
-            f"`{p}perms` — liste tous les rangs"
+            f"`{p}wl @u` ・ `{p}unwl @u` — **Whitelist** (limites strictes)\n"
+            f"`{p}owner @u` ・ `{p}unowner @u` — **Owner** (limites moyennes)\n"
+            f"`{p}sys @u` ・ `{p}unsys @u` — **Sys** (limites élevées)\n"
+            f"`{p}perms` — voir tous les rangs attribués"
         ),
         inline=False,
     )
 
     em.add_field(
-        name="🤖 Bots whitelistés (bypass total)",
+        name="🤖 Bots whitelistés",
         value=(
-            f"`{p}bot @bot` — whitelist un bot (bypass infini)\n"
-            f"`{p}unbot @bot` — retirer\n"
-            f"`{p}bots` — liste"
+            f"`{p}bot @bot` — bypass total pour un bot\n"
+            f"`{p}unbot @bot` — retirer ・ `{p}bots` — liste"
         ),
         inline=False,
     )
 
     em.add_field(
-        name="⏱️ Limites",
+        name="⏱️ Limites & surveillance",
         value=(
-            f"`{p}actions` — actions surveillées\n"
-            f"`{p}limits` — voir les limites\n"
+            f"`{p}actions` — actions surveillées ・ `{p}limits` — limites actuelles\n"
             f"`{p}setlimit <action> <rang> <max> <min>` — configurer\n"
             f"`{p}unsetlimit <action> <rang>` — retirer"
         ),
@@ -3017,13 +3021,10 @@ async def _help(ctx):
     )
 
     em.add_field(
-        name=f"📦 Backups (auto toutes les {BACKUP_INTERVAL_MIN}min, {MAX_BACKUPS_PER_GUILD} max)",
+        name=f"📦 Backups (auto {BACKUP_INTERVAL_MIN}min, {MAX_BACKUPS_PER_GUILD} max)",
         value=(
-            f"`{p}backup` — backup manuel immédiat\n"
-            f"`{p}backuplist` — voir les backups disponibles\n"
-            f"`{p}revert [id]` — **revert manuel** depuis le dernier backup (ou précis)\n"
-            f"`{p}revertconfirm` — valider le revert (30s)\n"
-            f"*Revert auto aussi en cas d'abus détecté (ban + restore de l'action).*"
+            f"`{p}backup` — backup manuel ・ `{p}backuplist` — voir\n"
+            f"`{p}revert [id]` → `{p}revertconfirm` — revert manuel (30s)"
         ),
         inline=False,
     )
@@ -3038,24 +3039,15 @@ async def _help(ctx):
     )
 
     em.add_field(
-        name="📜 Suivi",
+        name="📜 Suivi & config",
         value=(
-            f"`{p}history [@u]` — historique des actions\n"
-            f"`{p}autobans` — bans auto récents"
+            f"`{p}history [@u]` — actions d'un user ・ `{p}autobans` — bans récents\n"
+            f"`{p}prefix [nouveau]` — changer le prefix du bot"
         ),
         inline=False,
     )
 
-    em.add_field(
-        name="⚙️ Config",
-        value=(
-            f"`{p}setlog #salon` — salon log global (fallback)\n"
-            f"`{p}prefix [nouveau]` — changer le prefix"
-        ),
-        inline=False,
-    )
-
-    em.set_footer(text="mFast ・ Meira")
+    em.set_footer(text=f"mFast ・ Meira ・ {format_french_date()}")
     await ctx.send(embed=em)
 
 
