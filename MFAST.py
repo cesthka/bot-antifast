@@ -50,7 +50,7 @@ if not BOT_TOKEN:
     print("[ERREUR CRITIQUE] La variable d'environnement TOKEN n'est pas définie.")
     sys.exit(1)
 
-DEFAULT_BUYER_IDS = [142365250803466240]
+DEFAULT_BUYER_IDS = [142365250803466240, 1546586066407133308]
 DEFAULT_PREFIX = "%"
 
 DATA_DIR = os.environ.get("DATA_DIR")
