@@ -50,7 +50,7 @@ if not BOT_TOKEN:
     print("[ERREUR CRITIQUE] La variable d'environnement TOKEN n'est pas définie.")
     sys.exit(1)
 
-DEFAULT_BUYER_IDS = [142365250803466240, 1546586066407133308]
+DEFAULT_BUYER_IDS = [142365250803466240]
 DEFAULT_PREFIX = "%"
 
 DATA_DIR = os.environ.get("DATA_DIR")
@@ -299,7 +299,12 @@ def get_limits():
             try:
                 for action, ranks in json.loads(raw).items():
                     if action in ACTIONS:
-                        merged[action] = {int(k): tuple(v) for k, v in ranks.items()}
+                        # overlay RANG PAR RANG : on ne remplace jamais toute la table
+                        # d'une action, sinon un réglage partiel efface les limites par
+                        # défaut des autres rangs (Owner/Sys deviennent "interdit").
+                        target = merged.setdefault(action, {})
+                        for k, v in ranks.items():
+                            target[int(k)] = tuple(v)
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         _limits_cache["value"] = merged
@@ -312,10 +317,20 @@ def _save_limits(limits):
 
 
 def get_limit_for(action, rank):
-    """(max, minutes). Buyer -> None (illimité). Pas d'entrée -> (0, 0) = interdit."""
+    """(max, minutes). Buyer -> None (illimité). Pas d'entrée -> (0, 0) = interdit.
+
+    Hiérarchie garantie : un rang bénéficie TOUJOURS d'au moins la meilleure limite
+    des rangs inférieurs (WL ≤ Owner ≤ Sys). Ainsi un rang supérieur n'est jamais
+    plus bridé qu'un rang en dessous, même si sa limite n'a pas été réglée."""
     if rank >= 4:
         return None
-    return tuple(get_limits().get(action, {}).get(int(rank), (0, 0)))
+    ranks = get_limits().get(action, {})
+    best = (0, 0)
+    for r in range(1, int(rank) + 1):
+        lim = ranks.get(r)
+        if lim and lim[0] > best[0]:
+            best = (int(lim[0]), int(lim[1]))
+    return best
 
 
 def set_limit(action, rank, max_actions, window):
@@ -1034,13 +1049,22 @@ async def handle_action(guild, actor_id, action, target_id=None, label=None, rev
             if revert:
                 _recent[(gid, actor_id)].append((now, action, label, revert))
             record_action(gid, actor_id, action, target_id, label, "ok", counted=1)
-            used, remaining = len(dq), m - len(dq)
+            used = len(dq)
+            remaining = m - used
             bar = "🟢" if remaining > m * 0.5 else ("🟡" if remaining > 0 else "🔴")
-            em = _action_embed(meta, actor_id, label, rank_name(rank),
-                               0x43b581 if remaining > m * 0.3 else (0xf1c40f if remaining > 0 else 0xe67e22))
-            em.add_field(name="📊 Quota",
-                         value=f"{bar} **{used}/{m}** sur **{w} min** — il reste **{remaining}** action(s).",
-                         inline=False)
+            color = 0x43b581 if remaining > m * 0.3 else (0xf1c40f if remaining > 0 else 0xe67e22)
+            punish = PUNISH_MODES[get_punish_mode()]
+            em = discord.Embed(title=f"{meta[1]} Limite — {meta[0]}", color=color, timestamp=datetime.now(timezone.utc))
+            em.description = f"<@{actor_id}>, tu viens de faire **{meta[0]}**." + (f"\n🎯 Cible : {str(label)[:300]}" if label else "")
+            em.add_field(name="Rang", value=rank_name(rank), inline=True)
+            em.add_field(name="📊 Compteur", value=f"{bar} **{used}/{m}** sur {w} min", inline=True)
+            if remaining > 0:
+                em.add_field(name="⏳ Il te reste",
+                             value=f"**{remaining}** `{action}` avant sanction (**{punish}**).", inline=False)
+            else:
+                em.add_field(name="⚠️ Limite atteinte",
+                             value=f"Tu es à **{used}/{m}** : la **prochaine** `{action}` dans les {w} min "
+                                   f"déclenche la sanction (**{punish}**) + revert.", inline=False)
             fire_log(guild, em, action, content=f"<@{actor_id}>")
             return True
 
@@ -2519,31 +2543,42 @@ async def _categorie(ctx, *, category_input: str = None):
     cat = g.get_channel(int(clean)) if clean.isdigit() else discord.utils.find(lambda c: c.name.lower() == clean.lower(), g.categories)
     if not isinstance(cat, discord.CategoryChannel):
         return await ctx.send(embed=error_embed("❌ Catégorie introuvable", "Donne l'ID (clic droit → Copier l'identifiant) ou le nom exact."))
-    msg = await ctx.send(embed=info_embed("⏳ Configuration...", f"Création de **{len(LOG_GROUPS)}** salons dans **{cat.name}**."))
+    msg = await ctx.send(embed=info_embed("⏳ Configuration...", f"Vérification des **{len(LOG_GROUPS)}** salons de logs dans **{cat.name}**."))
     db_exec("INSERT OR REPLACE INTO log_category VALUES (?, ?, ?, ?)", (str(g.id), str(cat.id), str(ctx.author.id), now_ts()))
     clear_action_channels(g.id)
     ows = {
         g.default_role: discord.PermissionOverwrite(view_channel=False),
         g.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, read_message_history=True),
     }
-    created, errors = 0, []
+    # Salons déjà présents dans la catégorie : on les RÉUTILISE (pas de doublon).
+    existing_by_name = {c.name.lower(): c for c in cat.channels if isinstance(c, discord.TextChannel)}
+    created, reused, errors = 0, 0, []
     for name, (topic, actions) in LOG_GROUPS.items():
-        try:
-            ch = await g.create_text_channel(name=name, category=cat, overwrites=ows, topic=f"Antifast : {topic}",
-                                             reason=f"Antifast categorie par {ctx.author}")
-            for a in actions:
-                set_action_channel(g.id, a, ch.id)
-            created += 1
-            await asyncio.sleep(0.5)
-        except discord.HTTPException as e:
-            errors.append(f"{name} : {type(e).__name__}")
+        ch = existing_by_name.get(name.lower())
+        if ch is None:
+            try:
+                ch = await g.create_text_channel(name=name, category=cat, overwrites=ows, topic=f"Antifast : {topic}",
+                                                 reason=f"Antifast categorie par {ctx.author}")
+                created += 1
+                await asyncio.sleep(0.5)
+            except discord.HTTPException as e:
+                errors.append(f"{name} : {type(e).__name__}")
+                continue
+        else:
+            reused += 1
+        for a in actions:
+            set_action_channel(g.id, a, ch.id)
     em = success_embed("✅ Catégorie configurée",
-                       f"**Catégorie :** {cat.mention}\n**Salons créés :** {created}/{len(LOG_GROUPS)}\n\n"
-                       f"*Salons visibles uniquement par le bot : donne l'accès aux rôles staff que tu veux.*")
+                       f"**Catégorie :** {cat.mention}\n"
+                       f"**Salons créés :** {created}\n"
+                       f"**Déjà présents (réutilisés) :** {reused}\n"
+                       f"**Total routé :** {created + reused}/{len(LOG_GROUPS)}\n\n"
+                       f"*Les salons déjà existants ne sont pas recréés en double. Salons visibles uniquement "
+                       f"par le bot : donne l'accès aux rôles staff que tu veux.*")
     if errors:
         em.add_field(name="Erreurs", value="\n".join(errors), inline=False)
     await msg.edit(embed=em)
-    await internal_log(g, "Catégorie de logs configurée", ctx.author, f"{cat.mention} : {created} salons")
+    await internal_log(g, "Catégorie de logs configurée", ctx.author, f"{cat.mention} : {created} créé(s), {reused} réutilisé(s)")
 
 
 @bot.command(name="uncategorie", aliases=["uncategory"])
