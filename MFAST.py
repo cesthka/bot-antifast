@@ -156,6 +156,7 @@ LOG_GROUPS = {
                        ["guild_update", "vanity_url", "webhook_create", "webhook_delete", "emoji_delete"]),
     "logs-bots":      ("Bots ajoutés, atteintes au bot / à la hiérarchie", ["bot_add", "tamper"]),
     "logs-sanctions": ("Sanctions automatiques et reverts", ["_sanction"]),
+    "logs-limites":   ("Toutes les actions surveillées en temps réel (ping + limite + avant), avec bouton Revert réservé au Buyer", ["_limit"]),
     "logs-antifast":  ("Commandes, config, backups, erreurs", ["_internal"]),
 }
 
@@ -1016,7 +1017,133 @@ def hierarchy_violation(actor_id, target_id):
     return None
 
 
-async def handle_action(guild, actor_id, action, target_id=None, label=None, revert=None, forced=None):
+# ---- Salon "logs-limites" : toutes les actions surveillées + bouton Revert (Buyer) ----
+def _limit_channel(guild):
+    cid = get_action_channels(guild.id).get("_limit")
+    return guild.get_channel(int(cid)) if cid else None
+
+
+class ConfirmRevertView(discord.ui.View):
+    """Confirmation fantôme (éphémère, visible du seul Buyer qui a cliqué)."""
+
+    def __init__(self, parent):
+        super().__init__(timeout=120)
+        self.parent = parent
+
+    @discord.ui.button(label="Accepter", style=discord.ButtonStyle.success, emoji="✅")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        revert = self.parent.revert
+        if revert is None:
+            return await interaction.edit_original_response(embed=error_embed("↩️ Déjà revert", "Cette action a déjà été annulée."), view=None)
+        try:
+            res = await revert()
+            em = success_embed("↩️ Revert effectué", f"Action de <@{self.parent.actor_id}> annulée : {res or 'ok'}")
+        except Exception as e:
+            log.error(f"revert bouton: {e}\n{traceback.format_exc()}")
+            em = error_embed("❌ Revert échoué", f"`{type(e).__name__}: {str(e)[:300]}`")
+        self.parent.mark_done(interaction.user)
+        await interaction.edit_original_response(embed=em, view=None)
+
+    @discord.ui.button(label="Refuser", style=discord.ButtonStyle.secondary, emoji="✖️")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=info_embed("✖️ Annulé", "Revert annulé."), view=None)
+
+
+class LimitRevertView(discord.ui.View):
+    """Bouton Revert visible par tous, utilisable uniquement par le Buyer."""
+
+    def __init__(self, actor_id, action, label, revert):
+        super().__init__(timeout=3600)
+        self.actor_id, self.action, self.label, self.revert, self.message = actor_id, action, label, revert, None
+        if revert is None:
+            self.revert_btn.disabled = True
+            self.revert_btn.label = "Rien à revert"
+
+    def mark_done(self, by):
+        self.revert = None
+        self.revert_btn.disabled = True
+        self.revert_btn.label = f"Reverted par {getattr(by, 'name', 'Buyer')}"[:80]
+        if self.message:
+            asyncio.create_task(self._edit_message())
+
+    async def _edit_message(self):
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Revert", style=discord.ButtonStyle.danger, emoji="↩️")
+    async def revert_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if get_rank_db(interaction.user.id) < 4:
+            return await interaction.response.send_message("↩️ Seul le **Buyer** peut revert une action.", ephemeral=True)
+        if self.revert is None:
+            return await interaction.response.send_message("Il n'y a rien à revert ici (ou c'est déjà fait).", ephemeral=True)
+        meta = ALL_ACTIONS.get(self.action, (self.action, "📋", ""))
+        em = warn_embed("↩️ Confirmer le revert",
+                        f"Annuler **{meta[0]}** fait par <@{self.actor_id}> ?"
+                        + (f"\n🎯 {self.label}" if self.label else "")
+                        + "\n\n*Remet comme avant : recrée / restaure ce qui a été supprimé ou modifié, "
+                        "ou supprime ce qui a été ajouté.*")
+        await interaction.response.send_message(embed=em, view=ConfirmRevertView(self), ephemeral=True)
+
+    async def on_timeout(self):
+        self.revert_btn.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+def build_limit_log_embed(meta, actor_id, action, label, before, rank_txt, counter):
+    punish = PUNISH_MODES[get_punish_mode()]
+    if counter is None:
+        color = 0x9b59b6
+    else:
+        _u, m, remaining, _w = counter
+        color = 0x43b581 if remaining > m * 0.3 else (0xf1c40f if remaining > 0 else 0xe67e22)
+    em = discord.Embed(title=f"{meta[1]} Limite — {meta[0]}", color=color, timestamp=datetime.now(timezone.utc))
+    em.description = f"<@{actor_id}> vient de faire **{meta[0]}**."
+    em.add_field(name="Rang", value=rank_txt, inline=True)
+    if counter is None:
+        em.add_field(name="📊 Compteur", value="♾️ illimité", inline=True)
+    else:
+        used, m, remaining, w = counter
+        bar = "🟢" if remaining > m * 0.5 else ("🟡" if remaining > 0 else "🔴")
+        em.add_field(name="📊 Compteur", value=f"{bar} **{used}/{m}** sur {w} min", inline=True)
+        if remaining > 0:
+            em.add_field(name="⏳ Il te reste", value=f"**{remaining}** `{action}` avant sanction (**{punish}**).", inline=False)
+        else:
+            em.add_field(name="⚠️ Limite atteinte",
+                         value=f"La **prochaine** `{action}` dans les {w} min = sanction (**{punish}**) + revert.", inline=False)
+    if label:
+        em.add_field(name="🎯 Cible / détail", value=str(label)[:1024], inline=False)
+    if before:
+        em.add_field(name="🕑 Avant", value=str(before)[:1024], inline=False)
+    em.set_footer(text="↩️ Revert : réservé au Buyer (confirmation privée)")
+    return em
+
+
+async def _send_limit_log(guild, meta, actor_id, action, label, before, revert, rank_txt, counter):
+    ch = _limit_channel(guild)
+    if ch is None:
+        return
+    em = build_limit_log_embed(meta, actor_id, action, label, before, rank_txt, counter)
+    view = LimitRevertView(actor_id, action, label, revert)
+    try:
+        msg = await ch.send(content=f"<@{actor_id}>", embed=em, view=view,
+                            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        view.message = msg
+    except discord.HTTPException as e:
+        log.warning(f"limit log: {e}")
+
+
+def fire_limit_log(guild, meta, actor_id, action, label, before, revert, rank_txt, counter):
+    asyncio.create_task(_send_limit_log(guild, meta, actor_id, action, label, before, revert, rank_txt, counter))
+
+
+async def handle_action(guild, actor_id, action, target_id=None, label=None, revert=None, forced=None, before=None):
     """Cœur du bot. Retourne True si l'action est autorisée, False si sanctionnée."""
     if actor_id is None or (bot.user and actor_id == bot.user.id):
         return True
@@ -1036,6 +1163,8 @@ async def handle_action(guild, actor_id, action, target_id=None, label=None, rev
         record_action(gid, actor_id, action, target_id, label, "buyer")
         txt = "👑 Buyer (illimité)" if rank >= 4 else "👑 Propriétaire du serveur"
         fire_log(guild, _action_embed(meta, actor_id, label, txt, 0x9b59b6), action)
+        # salon logs-limites : même les actions du Buyer/propriétaire y sont tracées + revert
+        fire_limit_log(guild, meta, actor_id, action, label, before, revert, txt, None)
         return True
 
     reason = forced
@@ -1068,7 +1197,11 @@ async def handle_action(guild, actor_id, action, target_id=None, label=None, rev
                 em.add_field(name="⚠️ Limite atteinte",
                              value=f"Tu es à **{used}/{m}** : la **prochaine** `{action}` dans les {w} min "
                                    f"déclenche la sanction (**{punish}**) + revert.", inline=False)
+            if before:
+                em.add_field(name="🕑 Avant", value=str(before)[:1024], inline=False)
             fire_log(guild, em, action, content=f"<@{actor_id}>")
+            # salon logs-limites : même embed + bouton Revert (Buyer uniquement)
+            fire_limit_log(guild, meta, actor_id, action, label, before, revert, rank_name(rank), (used, m, remaining, w))
             return True
 
     record_action(gid, actor_id, action, target_id, label, "violation")
@@ -1294,20 +1427,26 @@ async def h_role_update(e, g, actor, tid):
         return
     revert = lambda: rv_edit_role(g, tid, kwargs)
     name = role.name if role else tid
+    bparts = []
+    if "name" in kwargs:
+        bparts.append(f"Nom : `{kwargs['name']}` → `{role.name if role else '?'}`")
+    labels = {"permissions": "Permissions", "colour": "Couleur", "hoist": "Affichage séparé", "mentionable": "Mentionnable"}
+    bparts += [f"{labels[k]} modifié(e)" for k in labels if k in kwargs]
+    before = "\n".join(bparts) or None
 
     before_p = _diff(e, "before", "permissions")
     after_p = _diff(e, "after", "permissions")
     if role and (is_bot_role(g, role) or role == g.me.top_role) and before_p and after_p and after_p.value < before_p.value:
         await handle_action(g, actor, "tamper", tid, f"Rôle du bot {role.mention} modifié", revert,
-                            "Retrait de permissions sur le rôle du bot")
+                            "Retrait de permissions sur le rôle du bot", before=before)
         return
     if before_p is not None and after_p is not None:
         gained = after_p.value & DANGER_MASK & ~before_p.value
         if gained:
             await handle_action(g, actor, "role_perm_danger", tid,
-                                f"<@&{tid}> reçoit : {', '.join(danger_names(gained))}", revert)
+                                f"<@&{tid}> reçoit : {', '.join(danger_names(gained))}", revert, before=before)
             return
-    await handle_action(g, actor, "role_update", tid, f"<@&{tid}> ({name}) — {', '.join(kwargs)}", revert)
+    await handle_action(g, actor, "role_update", tid, f"<@&{tid}> ({name}) — {', '.join(kwargs)}", revert, before=before)
 
 
 async def h_channel_create(e, g, actor, tid):
@@ -1337,8 +1476,13 @@ async def h_channel_update(e, g, actor, tid):
     if not kwargs:
         return
     ch = g.get_channel(tid)
+    bparts = []
+    if "name" in kwargs:
+        bparts.append(f"Nom : `{kwargs['name']}` → `{ch.name if ch else '?'}`")
+    bparts += [f"{a} modifié" for a in ("topic", "nsfw", "slowmode_delay", "bitrate", "user_limit", "position") if a in kwargs]
+    before_desc = "\n".join(bparts) or None
     await handle_action(g, actor, "channel_update", tid,
-                        f"{ch.mention if ch else tid} — {', '.join(kwargs)}", lambda: rv_edit_channel(g, tid, kwargs))
+                        f"{ch.mention if ch else tid} — {', '.join(kwargs)}", lambda: rv_edit_channel(g, tid, kwargs), before=before_desc)
 
 
 async def h_overwrite(e, g, actor, tid):
@@ -1381,7 +1525,8 @@ async def h_guild_update(e, g, actor, tid):
         new = getattr(e.changes.after, "vanity_url_code", None)
         if _vanity_set_by_us.get(g.id) == new:
             return
-        allowed = await handle_action(g, actor, "vanity_url", None, f"{old} → {new}", lambda: rv_vanity(g, old))
+        allowed = await handle_action(g, actor, "vanity_url", None, f"{old} → {new}", lambda: rv_vanity(g, old),
+                                      before=f"Vanity : `{old}` → `{new}`")
         was_preempted = g.id in _vanity_preempted
         _vanity_preempted.discard(g.id)
         if allowed:
@@ -1403,7 +1548,13 @@ async def h_guild_update(e, g, actor, tid):
             kwargs["icon"] = base64.b64decode(icon_b64)
     if not kwargs:
         return
-    await handle_action(g, actor, "guild_update", None, f"Serveur — {', '.join(kwargs)}", lambda: rv_edit_guild(g, kwargs))
+    bparts = []
+    if "name" in kwargs:
+        bparts.append(f"Nom du serveur : `{kwargs['name']}` → `{getattr(g, 'name', '?')}`")
+    bparts += [f"{a} modifié" for a in kwargs if a != "name"]
+    before_desc = "\n".join(bparts) or None
+    await handle_action(g, actor, "guild_update", None, f"Serveur — {', '.join(kwargs)}",
+                        lambda: rv_edit_guild(g, kwargs), before=before_desc)
 
 
 async def h_webhook_create(e, g, actor, tid):
