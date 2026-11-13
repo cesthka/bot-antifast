@@ -1003,11 +1003,14 @@ def _prune_ts(dq, now, window):
 
 
 def hierarchy_violation(actor_id, target_id):
-    if target_id is None:
+    if target_id is None or actor_id == target_id:
+        # Agir sur SOI-MÊME n'est jamais une atteinte à la hiérarchie
+        # (ex : un Sys qui retire un de ses propres rôles décoratifs).
         return None
     if bot.user and target_id == bot.user.id:
         return "Action contre le bot Antifast"
     ar, tr = get_rank_db(actor_id), get_rank_db(target_id)
+    # On ne protège que les AUTRES de rang supérieur ou égal (pas soi-même).
     if tr >= 1 and tr >= ar and ar < 4:
         return f"Action contre un **{rank_name(tr)}** (rang supérieur ou égal au sien)"
     return None
